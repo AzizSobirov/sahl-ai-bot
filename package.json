@@ -1,0 +1,28 @@
+{
+  "name": "telegram-ai-assistant",
+  "version": "1.0.0",
+  "description": "A Telegram AI assistant bot with multiple AI-powered features",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "keywords": [
+    "telegram",
+    "bot",
+    "ai",
+    "openai",
+    "assistant"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "dependencies": {
+    "grammy": "^1.21.1",
+    "openai": "^4.52.7",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
