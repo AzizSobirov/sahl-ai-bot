@@ -15,7 +15,8 @@
     "openai",
     "assistant"
   ],
-  "author": "Your Name",
+  "author": "Aziz Sobirov",
+  "site": "https://azizdev.uz/",
   "license": "MIT",
   "dependencies": {
     "grammy": "^1.21.1",
