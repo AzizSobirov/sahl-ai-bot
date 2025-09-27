@@ -1,7 +1,8 @@
-import { Bot } from 'grammy';
+import { Bot, webhookCallback } from 'grammy';
 import { config } from 'dotenv';
 import { OpenAI } from 'openai';
 import { createServer } from 'http';
+import { URL } from 'url';
 
 // Load environment variables
 config();
@@ -480,34 +481,54 @@ bot.on('message:text', async (ctx) => {
 });
 
 // Graceful shutdown handling
-process.on('SIGINT', () => {
-    console.log('\n🛑 Shutting down bot gracefully...');
-    bot.stop();
-    server.close(() => {
-        console.log('🌐 HTTP server closed');
-        process.exit(0);
-    });
-});
+async function gracefulShutdown(signal) {
+    console.log(`\n🛑 Received ${signal}. Shutting down gracefully...`);
+    
+    try {
+        // Remove webhook if in production
+        if (isProduction) {
+            await bot.api.deleteWebhook();
+            console.log('🪝 Webhook removed');
+        }
+        
+        bot.stop();
+        console.log('🤖 Bot stopped');
+        
+        server.close(() => {
+            console.log('🌐 HTTP server closed');
+            process.exit(0);
+        });
+    } catch (error) {
+        console.error('❌ Error during shutdown:', error);
+        process.exit(1);
+    }
+}
 
-process.on('SIGTERM', () => {
-    console.log('\n🛑 Shutting down bot gracefully...');
-    bot.stop();
-    server.close(() => {
-        console.log('🌐 HTTP server closed');
-        process.exit(0);
-    });
-});
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
 // Create HTTP server for health checks and webhooks
-const server = createServer((req, res) => {
-    if (req.url === '/health' || req.url === '/') {
+const server = createServer(async (req, res) => {
+    const parsedUrl = new URL(req.url, `http://${req.headers.host}`);
+    
+    if (parsedUrl.pathname === '/health' || parsedUrl.pathname === '/') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ 
             status: 'ok', 
             bot: 'Telegram AI Assistant',
+            mode: isProduction ? 'webhook' : 'polling',
             uptime: process.uptime(),
             timestamp: new Date().toISOString()
         }));
+    } else if (parsedUrl.pathname === WEBHOOK_PATH && req.method === 'POST') {
+        // Handle Telegram webhook
+        try {
+            await handleWebhook(req, res);
+        } catch (error) {
+            console.error('Webhook error:', error);
+            res.writeHead(500);
+            res.end('Webhook Error');
+        }
     } else {
         res.writeHead(404, { 'Content-Type': 'text/plain' });
         res.end('Not Found');
@@ -517,14 +538,43 @@ const server = createServer((req, res) => {
 // Get port from environment variable or default to 3000
 const PORT = process.env.PORT || 3000;
 
+// Webhook configuration
+const WEBHOOK_URL = process.env.WEBHOOK_URL || process.env.RENDER_EXTERNAL_URL || 'https://sahl-ai-bot.onrender.com';
+const WEBHOOK_PATH = '/webhook';
+const isProduction = process.env.NODE_ENV === 'production' || process.env.RENDER_EXTERNAL_URL || process.env.WEBHOOK_URL;
+
+console.log(`🔧 Environment: ${isProduction ? 'Production (Webhook)' : 'Development (Polling)'}`);
+if (isProduction) {
+    console.log(`🪝 Webhook URL: ${WEBHOOK_URL}${WEBHOOK_PATH}`);
+}
+
+// Create webhook handler
+const handleWebhook = webhookCallback(bot, 'http');
+
 // Start the HTTP server
-server.listen(PORT, () => {
+server.listen(PORT, async () => {
     console.log(`🌐 HTTP server listening on port ${PORT}`);
     console.log(`🩺 Health check available at http://localhost:${PORT}/health`);
+    
+    console.log('🤖 Starting Telegram AI Assistant Bot...');
+    console.log(`📱 Model: ${OPENAI_MODEL}`);
+    
+    if (isProduction) {
+        // Production: Use webhooks
+        try {
+            const webhookUrl = `${WEBHOOK_URL}${WEBHOOK_PATH}`;
+            await bot.api.setWebhook(webhookUrl);
+            console.log(`🪝 Webhook set successfully: ${webhookUrl}`);
+            console.log('✅ Bot is running in webhook mode! Ready to receive updates.');
+        } catch (error) {
+            console.error('❌ Failed to set webhook:', error);
+            console.log('⚠️ Falling back to polling mode...');
+            bot.start();
+        }
+    } else {
+        // Development: Use polling
+        console.log('🔄 Starting in polling mode for development...');
+        bot.start();
+        console.log('✅ Bot is running in polling mode! Press Ctrl+C to stop.');
+    }
 });
-
-// Start the bot
-console.log('🤖 Starting Telegram AI Assistant Bot...');
-console.log(`📱 Model: ${OPENAI_MODEL}`);
-bot.start();
-console.log('✅ Bot is running! Press Ctrl+C to stop.');
