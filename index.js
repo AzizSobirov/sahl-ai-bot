@@ -1,6 +1,7 @@
 import { Bot } from 'grammy';
 import { config } from 'dotenv';
 import { OpenAI } from 'openai';
+import { createServer } from 'http';
 
 // Load environment variables
 config();
@@ -482,13 +483,44 @@ bot.on('message:text', async (ctx) => {
 process.on('SIGINT', () => {
     console.log('\n🛑 Shutting down bot gracefully...');
     bot.stop();
-    process.exit(0);
+    server.close(() => {
+        console.log('🌐 HTTP server closed');
+        process.exit(0);
+    });
 });
 
 process.on('SIGTERM', () => {
     console.log('\n🛑 Shutting down bot gracefully...');
     bot.stop();
-    process.exit(0);
+    server.close(() => {
+        console.log('🌐 HTTP server closed');
+        process.exit(0);
+    });
+});
+
+// Create HTTP server for health checks and webhooks
+const server = createServer((req, res) => {
+    if (req.url === '/health' || req.url === '/') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ 
+            status: 'ok', 
+            bot: 'Telegram AI Assistant',
+            uptime: process.uptime(),
+            timestamp: new Date().toISOString()
+        }));
+    } else {
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.end('Not Found');
+    }
+});
+
+// Get port from environment variable or default to 3000
+const PORT = process.env.PORT || 3000;
+
+// Start the HTTP server
+server.listen(PORT, () => {
+    console.log(`🌐 HTTP server listening on port ${PORT}`);
+    console.log(`🩺 Health check available at http://localhost:${PORT}/health`);
 });
 
 // Start the bot
