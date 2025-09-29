@@ -1,8 +1,10 @@
-import { Bot } from "grammy";
+import { Bot, InlineKeyboard, InputFile } from "grammy";
 import { config } from "dotenv";
 import { OpenAI } from "openai";
 import { createServer } from "http";
 import https from "https";
+import fs from "fs/promises";
+import path from "path";
 
 // Load environment variables
 config();
@@ -25,6 +27,148 @@ const openai = new OpenAI({
 });
 
 const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+
+// Data file path
+const DATA_FILE_PATH = path.join(process.cwd(), "data.json");
+
+// Initialize data.json if it doesn't exist
+async function initializeDataFile() {
+  try {
+    await fs.access(DATA_FILE_PATH);
+  } catch (error) {
+    // File doesn't exist, create it
+    const initialData = {
+      users: {},
+      groups: {},
+      bannedUsers: [],
+      bannedGroups: [],
+      superAdmin: process.env.SUPER_ADMIN,
+      statistics: {
+        totalAiRequests: 0,
+        totalMessages: 0,
+        botStarted: new Date().toISOString(),
+      },
+      settings: {
+        antiSpamEnabled: true,
+        createdAt: new Date().toISOString(),
+        version: "1.0.0",
+      },
+    };
+    await fs.writeFile(DATA_FILE_PATH, JSON.stringify(initialData, null, 2));
+    console.log("📄 data.json file created");
+  }
+}
+
+// Read data from JSON file
+async function readData() {
+  try {
+    const data = await fs.readFile(DATA_FILE_PATH, "utf8");
+    return JSON.parse(data);
+  } catch (error) {
+    console.error("Error reading data.json:", error);
+    return {
+      users: {},
+      groups: {},
+      bannedUsers: [],
+      bannedGroups: [],
+      superAdmin: process.env.SUPER_ADMIN,
+      statistics: { totalAiRequests: 0, totalMessages: 0 },
+      settings: { antiSpamEnabled: true },
+    };
+  }
+}
+
+// Write data to JSON file
+async function writeData(data) {
+  try {
+    await fs.writeFile(DATA_FILE_PATH, JSON.stringify(data, null, 2));
+  } catch (error) {
+    console.error("Error writing to data.json:", error);
+  }
+}
+
+// Check if user is super admin
+function isSuperAdmin(userId, data) {
+  return userId.toString() === data.superAdmin.toString();
+}
+
+// Save or update user information
+async function saveUserInfo(userId, userInfo, isAiRequest = false) {
+  try {
+    const data = await readData();
+
+    // Check if user is banned
+    if (data.bannedUsers.includes(userId.toString())) {
+      return false; // User is banned
+    }
+
+    if (!data.users[userId]) {
+      data.users[userId] = {
+        id: userId,
+        firstName: userInfo.first_name || "",
+        lastName: userInfo.last_name || "",
+        username: userInfo.username || "",
+        joinedAt: new Date().toISOString(),
+        messageCount: 1,
+        lastActivity: new Date().toISOString(),
+        isBlocked: false,
+        aiRequests: isAiRequest ? 1 : 0,
+      };
+    } else {
+      // Update existing user
+      data.users[userId].messageCount += 1;
+      data.users[userId].lastActivity = new Date().toISOString();
+      if (isAiRequest) data.users[userId].aiRequests += 1;
+      if (userInfo.first_name)
+        data.users[userId].firstName = userInfo.first_name;
+      if (userInfo.last_name) data.users[userId].lastName = userInfo.last_name;
+      if (userInfo.username) data.users[userId].username = userInfo.username;
+    }
+
+    // Update statistics
+    data.statistics.totalMessages += 1;
+    if (isAiRequest) data.statistics.totalAiRequests += 1;
+
+    await writeData(data);
+    return true; // User is not banned
+  } catch (error) {
+    console.error("Error saving user info:", error);
+    return true; // Allow on error
+  }
+}
+
+// Save group information
+async function saveGroupInfo(groupId, groupInfo) {
+  try {
+    const data = await readData();
+
+    // Check if group is banned
+    if (data.bannedGroups.includes(groupId.toString())) {
+      return false; // Group is banned
+    }
+
+    if (!data.groups[groupId]) {
+      data.groups[groupId] = {
+        id: groupId,
+        title: groupInfo.title || "",
+        type: groupInfo.type || "",
+        joinedAt: new Date().toISOString(),
+        messageCount: 1,
+        lastActivity: new Date().toISOString(),
+      };
+    } else {
+      data.groups[groupId].messageCount += 1;
+      data.groups[groupId].lastActivity = new Date().toISOString();
+      if (groupInfo.title) data.groups[groupId].title = groupInfo.title;
+    }
+
+    await writeData(data);
+    return true;
+  } catch (error) {
+    console.error("Error saving group info:", error);
+    return true;
+  }
+}
 
 // System prompt for the AI assistant
 const SYSTEM_PROMPT = `You are an AI assistant working inside a Telegram bot. 
@@ -172,6 +316,16 @@ async function handleSmartResponse(ctx, userText, originalContext = null) {
   }
 
   try {
+    // Check if user is banned before processing AI request
+    const userAllowed = await saveUserInfo(
+      ctx.message.from.id,
+      ctx.message.from,
+      true
+    );
+    if (!userAllowed) {
+      return false; // User is banned
+    }
+
     // Show typing indicator
     await ctx.replyWithChatAction("typing");
 
@@ -202,8 +356,523 @@ bot.catch((err) => {
   ctx.reply("⚠️ Error: Something went wrong, please try again later.");
 });
 
+// Admin panel functions
+function createMainAdminKeyboard() {
+  return new InlineKeyboard()
+    .text("📊 Statistics", "admin_stats")
+    .text("👥 Users", "admin_users")
+    .row()
+    .text("🚫 Banned Users", "admin_banned_users")
+    .text("🚫 Banned Groups", "admin_banned_groups")
+    .row()
+    .text("⚙️ Settings", "admin_settings")
+    .text("📥 Download Data", "admin_download")
+    .row()
+    .text("🔄 Refresh", "admin_refresh");
+}
+
+function createUserListKeyboard(users, page = 0, itemsPerPage = 5) {
+  const keyboard = new InlineKeyboard();
+  const startIndex = page * itemsPerPage;
+  const endIndex = startIndex + itemsPerPage;
+  const paginatedUsers = users.slice(startIndex, endIndex);
+
+  paginatedUsers.forEach((user, index) => {
+    const userText = `${user.firstName} ${user.lastName || ""} (@${
+      user.username || "no_username"
+    })`;
+    keyboard.text(userText, `user_${user.id}`).row();
+  });
+
+  // Navigation buttons
+  const navRow = [];
+  if (page > 0) {
+    navRow.push(keyboard.text("⬅️ Previous", `users_page_${page - 1}`));
+  }
+  if (endIndex < users.length) {
+    navRow.push(keyboard.text("Next ➡️", `users_page_${page + 1}`));
+  }
+  if (navRow.length > 0) keyboard.row();
+
+  keyboard.text("🔙 Back to Admin", "admin_main");
+  return keyboard;
+}
+
+function createUserActionKeyboard(userId, isBlocked = false) {
+  const keyboard = new InlineKeyboard();
+
+  if (isBlocked) {
+    keyboard.text("🔓 Unblock User", `unblock_user_${userId}`);
+  } else {
+    keyboard.text("🔒 Block User", `block_user_${userId}`);
+  }
+
+  keyboard
+    .row()
+    .text("📊 User Stats", `user_stats_${userId}`)
+    .text("🔙 Back to Users", "admin_users");
+
+  return keyboard;
+}
+
+// Admin command
+bot.command("admin", async (ctx) => {
+  try {
+    const data = await readData();
+
+    if (!isSuperAdmin(ctx.message.from.id, data)) {
+      return ctx.reply("❌ You are not authorized to use this command!");
+    }
+
+    const users = Object.values(data.users);
+    const totalUsers = users.length;
+    const totalAiRequests = data.statistics.totalAiRequests || 0;
+    const totalMessages = data.statistics.totalMessages || 0;
+    const bannedUsersCount = data.bannedUsers.length;
+    const bannedGroupsCount = data.bannedGroups.length;
+
+    // Get active users (last 24 hours)
+    const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const activeUsers = users.filter(
+      (user) => new Date(user.lastActivity) > dayAgo
+    ).length;
+
+    const currentTime = new Date().toLocaleTimeString();
+    const adminMessage = `🔧 **Super Admin Panel**
+
+📊 **Statistics:**
+👥 Total Users: **${totalUsers}**
+🤖 Total AI Requests: **${totalAiRequests}**
+💬 Total Messages: **${totalMessages}**
+🔥 Active Users (24h): **${activeUsers}**
+
+🚫 **Moderation:**
+❌ Banned Users: **${bannedUsersCount}**
+❌ Banned Groups: **${bannedGroupsCount}**
+
+🤖 Bot Started: ${new Date(data.statistics.botStarted).toLocaleString()}
+🔄 Opened at: ${currentTime}`;
+
+    await ctx.reply(adminMessage, {
+      reply_markup: createMainAdminKeyboard(),
+      parse_mode: "Markdown",
+    });
+  } catch (error) {
+    console.error("Error in admin command:", error);
+    ctx.reply("❌ Error loading admin panel.");
+  }
+});
+
+// Handle admin callback queries
+bot.callbackQuery(/^admin_/, async (ctx) => {
+  try {
+    const data = await readData();
+
+    if (!isSuperAdmin(ctx.callbackQuery.from.id, data)) {
+      return ctx.answerCallbackQuery("❌ Unauthorized!");
+    }
+
+    const action = ctx.callbackQuery.data;
+
+    switch (action) {
+      case "admin_stats":
+        const users = Object.values(data.users);
+        const groups = Object.values(data.groups);
+
+        const statsMessage = `📊 **Detailed Statistics**
+
+👥 **Users:**
+• Total: ${users.length}
+• Active (7d): ${
+          users.filter(
+            (u) =>
+              new Date(u.lastActivity) >
+              new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
+          ).length
+        }
+• Active (30d): ${
+          users.filter(
+            (u) =>
+              new Date(u.lastActivity) >
+              new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
+          ).length
+        }
+
+🏘️ **Groups:**
+• Total: ${groups.length}
+• Active (7d): ${
+          groups.filter(
+            (g) =>
+              new Date(g.lastActivity) >
+              new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
+          ).length
+        }
+
+🤖 **AI Usage:**
+• Total Requests: ${data.statistics.totalAiRequests}
+• Total Messages: ${data.statistics.totalMessages}
+• Average per User: ${
+          users.length > 0
+            ? (data.statistics.totalAiRequests / users.length).toFixed(2)
+            : 0
+        }`;
+
+        await ctx.editMessageText(statsMessage, {
+          reply_markup: new InlineKeyboard().text("🔙 Back", "admin_refresh"),
+          parse_mode: "Markdown",
+        });
+        break;
+
+      case "admin_users":
+        const allUsers = Object.values(data.users);
+        if (allUsers.length === 0) {
+          await ctx.editMessageText("👥 No users found.", {
+            reply_markup: new InlineKeyboard().text("🔙 Back", "admin_refresh"),
+          });
+        } else {
+          await ctx.editMessageText(
+            `👥 **Users (${allUsers.length} total)**\n\nSelect a user to manage:`,
+            {
+              reply_markup: createUserListKeyboard(allUsers, 0),
+              parse_mode: "Markdown",
+            }
+          );
+        }
+        break;
+
+      case "admin_banned_users":
+        const bannedUsers = data.bannedUsers.map((id) => {
+          const user = data.users[id];
+          return user
+            ? `${user.firstName} ${user.lastName || ""} (@${
+                user.username || id
+              })`
+            : `ID: ${id}`;
+        });
+
+        const bannedMessage =
+          bannedUsers.length > 0
+            ? `🚫 **Banned Users (${
+                bannedUsers.length
+              }):**\n\n${bannedUsers.join("\n")}`
+            : "✅ No banned users.";
+
+        await ctx.editMessageText(bannedMessage, {
+          reply_markup: new InlineKeyboard().text("🔙 Back", "admin_refresh"),
+          parse_mode: "Markdown",
+        });
+        break;
+
+      case "admin_banned_groups":
+        const bannedGroups = data.bannedGroups.map((id) => {
+          const group = data.groups[id];
+          return group ? `${group.title} (${id})` : `ID: ${id}`;
+        });
+
+        const bannedGroupsMessage =
+          bannedGroups.length > 0
+            ? `🚫 **Banned Groups (${
+                bannedGroups.length
+              }):**\n\n${bannedGroups.join("\n")}`
+            : "✅ No banned groups.";
+
+        await ctx.editMessageText(bannedGroupsMessage, {
+          reply_markup: new InlineKeyboard().text("🔙 Back", "admin_refresh"),
+          parse_mode: "Markdown",
+        });
+        break;
+
+      case "admin_settings":
+        const settingsMessage = `⚙️ **Bot Settings**
+
+🛡️ Anti-Spam: ${data.settings.antiSpamEnabled ? "Enabled" : "Disabled"}
+📅 Created: ${new Date(data.settings.createdAt).toLocaleDateString()}
+🔢 Version: ${data.settings.version}`;
+
+        await ctx.editMessageText(settingsMessage, {
+          reply_markup: new InlineKeyboard()
+            .text(
+              data.settings.antiSpamEnabled
+                ? "🔴 Disable Anti-Spam"
+                : "🟢 Enable Anti-Spam",
+              "toggle_antispam"
+            )
+            .row()
+            .text("🔙 Back", "admin_refresh"),
+          parse_mode: "Markdown",
+        });
+        break;
+
+      case "admin_download":
+        try {
+          // Read current data and send as document
+          const downloadData = await readData();
+          const dataContent = JSON.stringify(downloadData, null, 2);
+          const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+          const fileName = `bot-data-${timestamp}.json`;
+          
+          // Create a temporary message to inform user
+          await ctx.answerCallbackQuery("📥 Preparing download...");
+          
+          // Send the data as a document
+          await ctx.replyWithDocument(
+            new InputFile(Buffer.from(dataContent), fileName),
+            {
+              caption: `📊 Bot Data Export\n\n📅 Generated: ${new Date().toLocaleString()}\n📦 Size: ${Math.round(Buffer.byteLength(dataContent, 'utf8') / 1024 * 100) / 100} KB`,
+              reply_to_message_id: ctx.callbackQuery.message.message_id
+            }
+          );
+          
+        } catch (downloadError) {
+          console.error("Error downloading data:", downloadError);
+          await ctx.answerCallbackQuery("❌ Error generating download!");
+        }
+        return; // Don't call answerCallbackQuery again
+
+      case "admin_refresh":
+      case "admin_main":
+        // Refresh main admin panel
+        const refreshedData = await readData();
+        const refreshUsers = Object.values(refreshedData.users);
+        const refreshTotalUsers = refreshUsers.length;
+        const refreshTotalAiRequests =
+          refreshedData.statistics.totalAiRequests || 0;
+        const refreshTotalMessages =
+          refreshedData.statistics.totalMessages || 0;
+        const refreshBannedUsersCount = refreshedData.bannedUsers.length;
+        const refreshBannedGroupsCount = refreshedData.bannedGroups.length;
+
+        const refreshDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+        const refreshActiveUsers = refreshUsers.filter(
+          (user) => new Date(user.lastActivity) > refreshDayAgo
+        ).length;
+
+        // Add current time to make message unique
+        const currentTime = new Date().toLocaleTimeString();
+        const refreshAdminMessage = `🔧 **Super Admin Panel**
+
+📊 **Statistics:**
+👥 Total Users: **${refreshTotalUsers}**
+🤖 Total AI Requests: **${refreshTotalAiRequests}**
+💬 Total Messages: **${refreshTotalMessages}**
+🔥 Active Users (24h): **${refreshActiveUsers}**
+
+🚫 **Moderation:**
+❌ Banned Users: **${refreshBannedUsersCount}**
+❌ Banned Groups: **${refreshBannedGroupsCount}**
+
+🤖 Bot Started: ${new Date(refreshedData.statistics.botStarted).toLocaleString()}
+🔄 Last Refresh: ${currentTime}`;
+
+        try {
+          await ctx.editMessageText(refreshAdminMessage, {
+            reply_markup: createMainAdminKeyboard(),
+            parse_mode: "Markdown",
+          });
+        } catch (editError) {
+          // If edit fails due to same content, just answer callback
+          console.log("Message content unchanged, skipping edit");
+        }
+        break;
+    }
+
+    await ctx.answerCallbackQuery();
+  } catch (error) {
+    console.error("Error in admin callback:", error);
+    ctx.answerCallbackQuery("❌ Error occurred!");
+  }
+});
+
+// Handle user pagination
+bot.callbackQuery(/^users_page_(\d+)$/, async (ctx) => {
+  try {
+    const data = await readData();
+
+    if (!isSuperAdmin(ctx.callbackQuery.from.id, data)) {
+      return ctx.answerCallbackQuery("❌ Unauthorized!");
+    }
+
+    const page = parseInt(ctx.match[1]);
+    const allUsers = Object.values(data.users);
+
+    await ctx.editMessageText(
+      `👥 **Users (${allUsers.length} total)**\n\nSelect a user to manage:`,
+      {
+        reply_markup: createUserListKeyboard(allUsers, page),
+        parse_mode: "Markdown",
+      }
+    );
+
+    await ctx.answerCallbackQuery();
+  } catch (error) {
+    console.error("Error in user pagination:", error);
+    ctx.answerCallbackQuery("❌ Error occurred!");
+  }
+});
+
+// Handle user actions
+bot.callbackQuery(/^user_(\d+)$/, async (ctx) => {
+  try {
+    const data = await readData();
+
+    if (!isSuperAdmin(ctx.callbackQuery.from.id, data)) {
+      return ctx.answerCallbackQuery("❌ Unauthorized!");
+    }
+
+    const userId = ctx.match[1];
+    const user = data.users[userId];
+
+    if (!user) {
+      return ctx.answerCallbackQuery("❌ User not found!");
+    }
+
+    const isBlocked = data.bannedUsers.includes(userId);
+
+    const userMessage = `👤 **User Details**
+
+📝 Name: ${user.firstName} ${user.lastName || ""}
+👤 Username: @${user.username || "no_username"}
+🆔 ID: ${user.id}
+📅 Joined: ${new Date(user.joinedAt).toLocaleDateString()}
+💬 Messages: ${user.messageCount}
+🤖 AI Requests: ${user.aiRequests || 0}
+📱 Last Activity: ${new Date(user.lastActivity).toLocaleString()}
+🚫 Status: ${isBlocked ? "❌ Blocked" : "✅ Active"}`;
+
+    await ctx.editMessageText(userMessage, {
+      reply_markup: createUserActionKeyboard(userId, isBlocked),
+      parse_mode: "Markdown",
+    });
+
+    await ctx.answerCallbackQuery();
+  } catch (error) {
+    console.error("Error showing user details:", error);
+    ctx.answerCallbackQuery("❌ Error occurred!");
+  }
+});
+
+// Handle block/unblock user
+bot.callbackQuery(/^(block|unblock)_user_(\d+)$/, async (ctx) => {
+  try {
+    const data = await readData();
+
+    if (!isSuperAdmin(ctx.callbackQuery.from.id, data)) {
+      return ctx.answerCallbackQuery("❌ Unauthorized!");
+    }
+
+    const action = ctx.match[1];
+    const userId = ctx.match[2];
+    const user = data.users[userId];
+
+    if (!user) {
+      return ctx.answerCallbackQuery("❌ User not found!");
+    }
+
+    if (action === "block") {
+      if (!data.bannedUsers.includes(userId)) {
+        data.bannedUsers.push(userId);
+        data.users[userId].isBlocked = true;
+        await writeData(data);
+        await ctx.answerCallbackQuery(
+          `✅ User ${user.firstName} blocked successfully!`
+        );
+      } else {
+        await ctx.answerCallbackQuery("⚠️ User is already blocked!");
+      }
+    } else {
+      const index = data.bannedUsers.indexOf(userId);
+      if (index > -1) {
+        data.bannedUsers.splice(index, 1);
+        data.users[userId].isBlocked = false;
+        await writeData(data);
+        await ctx.answerCallbackQuery(
+          `✅ User ${user.firstName} unblocked successfully!`
+        );
+      } else {
+        await ctx.answerCallbackQuery("⚠️ User is not blocked!");
+      }
+    }
+
+    // Refresh the user details
+    const isBlocked = data.bannedUsers.includes(userId);
+
+    const userMessage = `👤 **User Details**
+
+📝 Name: ${user.firstName} ${user.lastName || ""}
+👤 Username: @${user.username || "no_username"}
+🆔 ID: ${user.id}
+📅 Joined: ${new Date(user.joinedAt).toLocaleDateString()}
+💬 Messages: ${user.messageCount}
+🤖 AI Requests: ${user.aiRequests || 0}
+📱 Last Activity: ${new Date(user.lastActivity).toLocaleString()}
+🚫 Status: ${isBlocked ? "❌ Blocked" : "✅ Active"}`;
+
+    await ctx.editMessageText(userMessage, {
+      reply_markup: createUserActionKeyboard(userId, isBlocked),
+      parse_mode: "Markdown",
+    });
+  } catch (error) {
+    console.error("Error blocking/unblocking user:", error);
+    ctx.answerCallbackQuery("❌ Error occurred!");
+  }
+});
+
+// Handle toggle anti-spam
+bot.callbackQuery("toggle_antispam", async (ctx) => {
+  try {
+    const data = await readData();
+
+    if (!isSuperAdmin(ctx.callbackQuery.from.id, data)) {
+      return ctx.answerCallbackQuery("❌ Unauthorized!");
+    }
+
+    data.settings.antiSpamEnabled = !data.settings.antiSpamEnabled;
+    await writeData(data);
+
+    const settingsMessage = `⚙️ **Bot Settings**
+
+🛡️ Anti-Spam: ${data.settings.antiSpamEnabled ? "Enabled" : "Disabled"}
+📅 Created: ${new Date(data.settings.createdAt).toLocaleDateString()}
+🔢 Version: ${data.settings.version}`;
+
+    await ctx.editMessageText(settingsMessage, {
+      reply_markup: new InlineKeyboard()
+        .text(
+          data.settings.antiSpamEnabled
+            ? "🔴 Disable Anti-Spam"
+            : "🟢 Enable Anti-Spam",
+          "toggle_antispam"
+        )
+        .row()
+        .text("🔙 Back", "admin_refresh"),
+      parse_mode: "Markdown",
+    });
+
+    await ctx.answerCallbackQuery(
+      `Anti-spam ${data.settings.antiSpamEnabled ? "enabled" : "disabled"}!`
+    );
+  } catch (error) {
+    console.error("Error toggling anti-spam:", error);
+    ctx.answerCallbackQuery("❌ Error occurred!");
+  }
+});
+
 // Start command
-bot.command("start", (ctx) => {
+bot.command("start", async (ctx) => {
+  // Save user information when they start the bot
+  const userAllowed = await saveUserInfo(ctx.message.from.id, ctx.message.from);
+  if (!userAllowed) {
+    return ctx.reply("❌ You are banned from using this bot.");
+  }
+
+  // Save group info if in group
+  if (ctx.chat.type === "group" || ctx.chat.type === "supergroup") {
+    const groupAllowed = await saveGroupInfo(ctx.chat.id, ctx.chat);
+    if (!groupAllowed) {
+      return; // Group is banned
+    }
+  }
+
   const welcomeMessage = `🤖 Welcome to AI Assistant Bot!
 
 Available commands:
@@ -263,6 +932,16 @@ bot.command("find", async (ctx) => {
   }
 
   try {
+    // Check if user is banned before processing AI request
+    const userAllowed = await saveUserInfo(
+      ctx.message.from.id,
+      ctx.message.from,
+      true
+    );
+    if (!userAllowed) {
+      return ctx.reply("❌ You are banned from using this bot.");
+    }
+
     // Show typing indicator
     await ctx.replyWithChatAction("typing");
 
@@ -294,6 +973,16 @@ bot.command("agent", async (ctx) => {
   }
 
   try {
+    // Check if user is banned before processing AI request
+    const userAllowed = await saveUserInfo(
+      ctx.message.from.id,
+      ctx.message.from,
+      true
+    );
+    if (!userAllowed) {
+      return ctx.reply("❌ You are banned from using this bot.");
+    }
+
     // Show typing indicator
     await ctx.replyWithChatAction("typing");
 
@@ -328,6 +1017,16 @@ bot.command("translate", async (ctx) => {
   }
 
   try {
+    // Check if user is banned before processing AI request
+    const userAllowed = await saveUserInfo(
+      ctx.message.from.id,
+      ctx.message.from,
+      true
+    );
+    if (!userAllowed) {
+      return ctx.reply("❌ You are banned from using this bot.");
+    }
+
     // Show typing indicator
     await ctx.replyWithChatAction("typing");
 
@@ -371,6 +1070,16 @@ bot.command("summarize", async (ctx) => {
   }
 
   try {
+    // Check if user is banned before processing AI request
+    const userAllowed = await saveUserInfo(
+      ctx.message.from.id,
+      ctx.message.from,
+      true
+    );
+    if (!userAllowed) {
+      return ctx.reply("❌ You are banned from using this bot.");
+    }
+
     // Show typing indicator
     await ctx.replyWithChatAction("typing");
 
@@ -402,6 +1111,16 @@ bot.command("improve", async (ctx) => {
   }
 
   try {
+    // Check if user is banned before processing AI request
+    const userAllowed = await saveUserInfo(
+      ctx.message.from.id,
+      ctx.message.from,
+      true
+    );
+    if (!userAllowed) {
+      return ctx.reply("❌ You are banned from using this bot.");
+    }
+
     // Show typing indicator
     await ctx.replyWithChatAction("typing");
 
@@ -433,6 +1152,16 @@ bot.command("talk", async (ctx) => {
   }
 
   try {
+    // Check if user is banned before processing AI request
+    const userAllowed = await saveUserInfo(
+      ctx.message.from.id,
+      ctx.message.from,
+      true
+    );
+    if (!userAllowed) {
+      return ctx.reply("❌ You are banned from using this bot.");
+    }
+
     // Show typing indicator
     await ctx.replyWithChatAction("typing");
 
@@ -455,6 +1184,25 @@ bot.command("talk", async (ctx) => {
 // Handle unknown commands or regular messages with smart reply detection
 bot.on("message:text", async (ctx) => {
   const text = ctx.message.text;
+
+  // Save user information for all messages (except bot messages)
+  if (ctx.message.from && !ctx.message.from.is_bot) {
+    const userAllowed = await saveUserInfo(
+      ctx.message.from.id,
+      ctx.message.from
+    );
+    if (!userAllowed) {
+      return; // User is banned, don't process message
+    }
+  }
+
+  // Save group info if in group
+  if (ctx.chat.type === "group" || ctx.chat.type === "supergroup") {
+    const groupAllowed = await saveGroupInfo(ctx.chat.id, ctx.chat);
+    if (!groupAllowed) {
+      return; // Group is banned
+    }
+  }
 
   // Skip if it's a command that was already handled
   if (text.startsWith("/")) {
@@ -599,8 +1347,18 @@ server.listen(PORT, () => {
   }
 });
 
-// Start the bot
-console.log("🤖 Starting Telegram AI Assistant Bot...");
-console.log(`📱 Model: ${OPENAI_MODEL}`);
-bot.start();
-console.log("✅ Bot is running! Press Ctrl+C to stop.");
+// Initialize data file and start the bot
+async function startBot() {
+  await initializeDataFile();
+
+  console.log("🤖 Starting Telegram AI Assistant Bot...");
+  console.log(`📱 Model: ${OPENAI_MODEL}`);
+  console.log("🛡️ Anti-spam protection enabled");
+  console.log("👤 User tracking and admin panel enabled");
+  console.log("📊 Statistics tracking enabled");
+
+  bot.start();
+  console.log("✅ Bot is running! Press Ctrl+C to stop.");
+}
+
+startBot().catch(console.error);
